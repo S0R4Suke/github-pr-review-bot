@@ -85,13 +85,13 @@ jobs:
           payload: |
             "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
             "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "<!subteam^${{ secrets.SLACK_GROUP_ID }}> ${{env.CC_MENTION}}" # グループメンションID
-                }
-              },
+              # {
+              #   "type": "section",
+              #   "text": {
+              #     "type": "mrkdwn",
+              #     "text": "<!subteam^${{ secrets.SLACK_GROUP_ID }}> ${{env.CC_MENTION}}" # グループメンションID
+              #   }
+              # },
               {
                 "type": "section",
                 "text": {
