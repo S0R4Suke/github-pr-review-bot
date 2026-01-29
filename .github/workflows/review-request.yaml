@@ -1,0 +1,200 @@
+name: "Code review request"
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  # レビュー依頼を行う
+  notification:
+    name: "Code review request to Slack"
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: read
+      checks: read
+      actions: read
+    if: |
+      github.event.issue.state == 'open' &&
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '/review')
+    steps:
+      # CIが通っているかチェックする
+      - name: "Checkout"
+        uses: actions/checkout@v4.2.1
+
+      - name: "Check CI status"
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr checks $PR_NUMBER --json bucket,name,state --jq '
+          .[] | select(.bucket == "fail") | .name
+          ' > failed_checks.txt
+
+          if [ -s failed_checks.txt ]; then
+            gh pr comment $PR_NUMBER --body "以下のチェックが失敗しています:
+            $(cat failed_checks.txt)"
+
+            exit 1
+          fi
+
+          gh pr checks $PR_NUMBER --json bucket,name,state --jq '
+          .[] | select(.bucket == "pending" or .bucket == "cancel") | .name
+          ' > pending_checks.txt
+
+          if [ -s pending_checks.txt ]; then
+            gh pr comment $PR_NUMBER --body "まだ完了していないチェックがあります:
+            $(cat pending_checks.txt)"
+            exit 1
+          fi
+
+          echo "すべてのチェックが成功しました"
+
+      # '/review'の削除, メンションの取得・cc:の挿入
+      - name: "Remove /review command"
+        run: |
+          #「/review <@1234567890> コメント」の場合、[<@1234567890>] を取り出す
+          CC_MENTION=$(echo "${{ github.event.comment.body }}" | sed -n 's/.*<\([^>]*\)>.*/<\1>/p')
+
+          # メンションがあった場合、cc:@hogeとして設定
+          if [ -n "$CC_MENTION" ]; then
+            echo "CC_MENTION=cc:${CC_MENTION}" >> $GITHUB_ENV
+          else
+          # CC_MENTIONが空の場合でも、空の値を設定する
+            echo "CC_MENTION=" >> $GITHUB_ENV
+          fi
+
+          #「/review <@1234567890> コメント」の場合、[コメント] を取り出す
+          REVIEW_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/\/review//g' | sed 's/<[^>]*>//g' | tr -d '\r')
+          echo "REVIEW_COMMENT=$REVIEW_COMMENT" >> $GITHUB_ENV
+
+      - name: "Remove double quotes from PR title"
+        run: |
+          # PRタイトルからダブルクォーテーションを削除
+          echo "PR_TITLE=$(echo "${{ github.event.issue.title }}" | sed 's/"//g')" >> $GITHUB_ENV
+
+      # CIが通っている場合レビュー依頼を行う
+      - name: "Request review to Slack"
+        id: slack
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          method: chat.postMessage # https://api.slack.com/methods/chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "<!subteam^${{ secrets.SLACK_GROUP_ID }}> ${{env.CC_MENTION}}" # グループメンションID
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "PRのレビュー依頼が届きました！ご確認をお願いします！:bow:"
+                }
+              },
+              {
+                "type": "context",
+                "elements": [
+                  {
+                    "type": "image",
+                    "image_url": "https://avatars.githubusercontent.com/${{ github.actor }}",
+                    "alt_text": "github_icon"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "${{ github.actor }}"
+                  },
+                  {
+                     "type": "mrkdwn",
+                     "text": "*Labels:${{ join(github.event.issue.labels.*.name, ', ') }}*"
+                   }
+                ]
+              },
+              {
+                "type": "rich_text",
+                "elements": [
+                  {
+                    "type": "rich_text_quote",
+                    "elements": [
+                      {
+                        "type": "text",
+                        "text": "タイトル \n",
+                        "style": {
+                          "bold": true
+                        }
+                      },
+                      {
+                        "type": "text",
+                        "text": "${{ env.PR_TITLE }} \n\n"
+                      },
+                      {
+                        "type": "text",
+                        "text": "URL \n",
+                        "style": {
+                          "bold": true
+                        }
+                      },
+                      {
+                        "type": "link",
+                        "url": "https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}"
+                      },
+                      {
+                        "type": "text",
+                        "text": "\n\nコメント \n",
+                        "style": {
+                          "bold": true
+                        }
+                      },
+                      {
+                        "type": "text",
+                        "text": "${{ join(env.REVIEW_COMMENT, ', ') }}\n"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+
+      - name: "Post comment"
+        uses: actions/github-script@v7.0.1
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+          MESSAGE: |
+            レビュー依頼を送信しました。
+            https://your-workspace.slack.com/archives/${{ steps.slack.outputs.channel_id }}/p${{ steps.slack.outputs.ts }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: process.env.PR_NUMBER,
+              body: process.env.MESSAGE
+            })
+
+  # CIが通っていない場合、またはスキップされた場合
+  addCommentIfSkipped:
+    runs-on: ubuntu-slim
+    needs: notification
+    permissions:
+      pull-requests: write
+    if: |
+      always() &&
+      github.event.issue.state == 'open' &&
+      github.event.issue.pull_request != null &&
+      github.event.comment.body == '/review' &&
+      (needs.notification.result == 'skipped' || needs.notification.result == 'failure')
+    steps:
+      - name: "Post comment"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr comment ${{ github.event.issue.number }} --body "レビュー依頼がスキップまたは失敗しました。チェックが失敗/実行中の場合は、全て成功させてから、再度実行してください。"
